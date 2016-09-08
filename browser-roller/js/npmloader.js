@@ -59,7 +59,7 @@
 	}
 }(this, function(fileDownloader, esprima){
 	var npmloader = {};
-  var npmCDNBaseUrl = "https://npmcdn.com/";
+  var npmCDNBaseUrl = "https://unpkg.com/";
   npmloader.baseUrl = npmCDNBaseUrl;
 
   var moduleList = [];
