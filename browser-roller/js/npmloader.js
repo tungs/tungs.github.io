@@ -58,16 +58,23 @@
 		root[moduleName] = factory(fileDownloader, root["esprima"]);
 	}
 }(this, function(fileDownloader, esprima){
-	var npmloader = {};
-  var npmCDNBaseUrl = "https://npmcdn.com/";
-  npmloader.baseUrl = npmCDNBaseUrl;
+	var npmloader = {
+    _cache: false
+  };
+  var unpkgBaseUrl = "https://unpkg.com/";
+  npmloader.baseUrl = unpkgBaseUrl;
 
   var moduleList = [];
   var modules = {};
   var cache = {};
 
+  var addCallback = function(p, callback){
+    return callback ? p.then(function(data){ callback(null, data); }, function(err){ callback(err, null); }) : p;
+  };
+  npmloader.addCallback = addCallback;
+
   var generateModuleUrl = function(moduleName, version){
-    return npmCDNBaseUrl + moduleName + (version ? '@' + version : '');
+    return unpkgBaseUrl + moduleName + (version ? '@' + version : '');
   };
   npmloader.generateModuleUrl = generateModuleUrl;
 
@@ -75,52 +82,76 @@
     console.log("Retrieving: "+fileUrl);
     var request;
     var cancel = false;
-    var requestFile = function(){
-      if(fileUrl in cache){
-        callback(null, cache[fileUrl]);
-        return;
-      }
-      request = fileDownloader(fileUrl, function(error, text){
-        if(error) // should have finer error handling
-        {
-          console.warn("Error Requesting File " + fileUrl, error);
-          if(!cancel) {
-            callback(error, null);
-/*
-            console.log("Retrying in 60 seconds");
-            setTimeout(requestFile, 60000);
-*/
-          }
-        } else {
-          cache[fileUrl] = text;
-          if(!cancel){
-            callback(error, text);
-          }
+    var ret;
+
+    var ret = addCallback(new Promise(function(resolve, reject){
+      var requestFile = function(){
+        if(npmloader._cache && fileUrl in cache){
+          resolve(cache[fileUrl]);
+          return;
         }
-      });
-    }
-    requestFile();
-    return {
-      cancel: function(){
+        request = fileDownloader(fileUrl, function(error, text){
+          if(error) // should have finer error handling
+          {
+            console.warn("Error Requesting File " + fileUrl, error);
+            if(!cancel) {
+              reject(error);
+  /*
+              console.log("Retrying in 60 seconds");
+              setTimeout(requestFile, 60000);
+  */
+            }
+          } else {
+            if(npmloader._cache){
+              cache[fileUrl] = text;
+            }
+            if(!cancel){
+              resolve(text);
+            } else {
+              reject(new Error("Request to "+fileUrl+" canceled"));
+            }
+          }
+        });
+      }
+      requestFile();
+    }), callback);
+
+    ret.cancel = function(){
         cancel = true;
         if(request){
           request.abort();
         }
-      },
-      getXHR: function(){
+      };
+    ret.getXHR = function(){
         return request;
       }
-    }  
+    return ret;
   };
   npmloader.retrieveFile = retrieveFile;
 
+  var NotFoundError = function(message) {
+    this.message = message;
+    this.stack = (new Error()).stack;
+  }
+
+  NotFoundError.prototype = Object.create(Error.prototype);
+  NotFoundError.prototype.name = 'FileNotFoundError';
+  NotFoundError.prototype.constructor = NotFoundError;
+  npmloader.NotFoundError = NotFoundError;
+
   var retrieveJSON = function(fileUrl, callback){
-    return retrieveFile(fileUrl, function(error, text){
-      callback(error, text ? JSON.parse(text) : null);
-    });
+    return addCallback(retrieveFile(fileUrl)
+      .then(function(text){
+        var ret = null;
+        try {
+          ret = JSON.parse(text);
+        } catch(e) {
+          throw new NotFoundError(fileUrl + " was not found!");
+        }
+        return ret;
+      }), callback);
   };
   npmloader.retrieveJSON = retrieveJSON;
-
 
   var retrieveModuleFile = function(moduleName, version, filepath, callback){
     return retrieveFile(generateModuleUrl(moduleName, version) + '/'+ filepath, callback);
@@ -142,75 +173,6 @@
   };
   npmloader.retrieveModuleDirectory = retrieveModuleDirectory;
 
-  var retrieveModuleJS = function(moduleName, version, callback){
-    var filepaths = [];
-    var filesToLoad = 0;
-    var moduleCode = {};
-    var walkDirectory = function(directory){
-      var i, path;
-      for(i=0; i<directory.files.length; i++){
-        path = directory.files[i].path;
-        if(directory.files[i].type==="directory"){ 
-          //if(!path.endsWith('/build')
-          walkDirectory(directory.files[i]);
-        } else if(path.endsWith('.js')){ // alternatively check if files[i].contentType==="application/javascript"
-          filepaths.push(path);
-        }
-      }
-    };
-    var loadCode = function(filepath, name, cb){
-      retrieveFile(filepath, function(err, code){
-        moduleCode[name] = code;
-        cb(err, code);
-      });
-    };
-    retrieveModuleDirectory(moduleName, version, function(error, directory){
-      var i;
-      var hasError = false;
-      walkDirectory(directory);
-      filesToLoad = filepaths.length;
-      for(i=0; i<filepaths.length; i++) {
-        loadCode(generateModuleUrl(moduleName, version) + filepaths[i], filepaths[i], function(err, code){
-          if(hasError){
-            return;
-          }
-          if(err){
-            hasError = true;
-            callback(err, null);
-          }
-          filesToLoad--;
-          if(!filesToLoad){
-            callback(err, {name: moduleName, version: version, files: moduleCode});
-          }
-        });      
-      }
-    });
-  };
-  npmloader.retrieveModuleJS = retrieveModuleJS;
-
-  var iterateList = function(list, iteration, itemCallback, callback){
-    var toLoad = list.length, i, hasError = false;
-    var loaded = function(ind, queryItem){
-      return function(err){
-        if(hasError){
-          return;
-        }
-        if(err){
-          hasError = true;
-          callback(err);
-        }
-        itemCallback.apply(this, [ind, queryItem].concat(Array.prototype.slice.call(arguments, 1)));
-        toLoad--;
-        if(!toLoad){
-          callback(err);
-        }
-      };
-    }
-    for(i=0;i<list.length;i++){
-      iteration(list[i], loaded(i, list[i]));
-    };
-  };
-
   var isArray = (Array && Array.isArray) ? Array.isArray : function(obj){
     return Object.prototype.toString(obj) === "[object Array]"; // this does not work in Node!
   };
@@ -219,11 +181,7 @@
     var moduleList = [], key;
     if(isArray(obj)){
       moduleList = obj.map(function(item){
-        if(typeof item === 'string'){
-          return {name: item, version: null}
-        } else {
-          return item;
-        }
+        return typeof item === 'string' ? {name: item, version: null} : item;
       });
     } else if(typeof obj === typeof {}){
       for(key in obj){
@@ -235,25 +193,6 @@
     return moduleList;
   };
   npmloader.resolveToModuleList = resolveToModuleList;
-
-  var iterateModuleList = function(moduleObj, moduleProcessor, callback){
-    var moduleList = resolveToModuleList(moduleObj);
-    var modules = [];
-    return iterateList(moduleList, function(listItem, cb){
-      moduleProcessor(listItem, cb);
-    }, function(ind, queryItem, retrievedItem){
-      modules[ind] = retrievedItem;
-    }, function(err){
-      callback(err, modules);
-    });
-  };
-
-  var retrieveModulesJS = function(moduleList, callback){
-    return iterateModuleList(moduleList, function(listItem, cb){
-      retrieveModuleJS(listItem.name, listItem.version, cb);
-    }, callback);
-  };
-  npmloader.retrieveModulesJS = retrieveModulesJS;
 
   var parseExportSymbols = function(src) {
     var symbols = [];
@@ -269,7 +208,7 @@
                 name: specifiers[j].exported.name,
                 local: specifiers[j].local.name,
                 from: prog.body[i].source.value
-              })
+              });
             }
           }
         }
@@ -279,121 +218,33 @@
   };
 
   var retrieveModuleExports = function(moduleName, version, callback){
-    retrieveModuleFile(moduleName, version, 'index.js', function(err, text){
-      if(err){
-        callback(err, null);
-      } else {
-        callback(err, parseExportSymbols(text));
-      }
-    });
+    return addCallback(retrieveModuleFile(moduleName, version, 'index.js').then(parseExportSymbols), callback);
   };
   npmloader.retrieveModuleExports = retrieveModuleExports;
 
   var retrieveModuleInfo = function(moduleName, version, callback){
-    var info = {};
-    var hasError = false;
-    var toLoad = 2;
-    var cbgen = function(processor) {
-      return function(err, data){
-        if(hasError){
-          // calback already called
-          return;
-        }
-        if(err){
-          hasError = true;
-          callback(err, null);
-          return;
-        }
-        processor(data);
-        toLoad--;
-        if(!toLoad){
-          callback(err, info);
-        }        
-      }
-    };
-
-    retrieveModulePackage(moduleName, version, cbgen(function(pack){
-      var key;
+    return addCallback(Promise.all([retrieveModulePackage(moduleName,version), retrieveModuleExports(moduleName,version)]).then(function(data){
+      var info = {}, key, pack = data[0], symbols = data[1];
       for(key in pack){
         if(pack.hasOwnProperty(key)){
           info[key] = pack[key];
-        }
+        }        
       }
-    }));
-
-    retrieveModuleExports(moduleName, version, cbgen(function(symbols){
       info.exportSymbols = symbols.map(function(item){
         return item.name;
       });
-    }));
+      return info;
+    }), callback);
   };
   npmloader.retrieveModuleInfo = retrieveModuleInfo;
 
+
   var retrieveModulesInfo = function(moduleList, callback){
-    return iterateModuleList(moduleList, function(listItem, cb){
-      retrieveModuleInfo(listItem.name, listItem.version, cb);
-    }, callback);
+    return addCallback(Promise.all(moduleList.map(function(module){
+      return retrieveModuleInfo(module.name, module.version);
+    })), callback);
   };
   npmloader.retrieveModulesInfo = retrieveModulesInfo;
-
-  var compareVersions = function(a, b){
-    // TODO: rethink how to compare nonspecific versions of modules (e.g. "~1.0.0"; ">=0.8.2"; etc)
-    var i = 0;
-    a = a.split('.');
-    b = b.split('.');
-    for(i=0; i < Math.max(a.length, b.length); i++){
-      if(i >= a.length && +b[i]>0){
-        return -1;
-      } else if(i >= b.length && +a[i]>0){
-        return 1;
-      }
-      if(i < a.length && i < b.length && +a[i] !== +b[i]){
-        return +a[i]-b[i];
-      }
-    }
-    return 0;
-  };
-  npmloader.compareVersions = compareVersions;
-
-  var modulesToLoad = 0;
-  var loadModuleDependencies = function(dependencies, callback){
-    var moduleName;
-    for(moduleName in dependencies){
-      if(dependencies.hasOwnProperty(moduleName)){
-        loadModuleAndDependencies(moduleName, dependencies[moduleName], callback);
-      }
-    }
-  };
-  npmloader.loadModuleDependencies = loadModuleDependencies;
-
-  var loadModuleAndDependencies = function(moduleName, version, callback){
-    var m;
-    if(moduleName in modules){ // a previous module was already loaded or is loading
-      if(compareVersions(modules[moduleName].version, version) >= 0) {
-        // previous load is fine
-          callback();
-        return;
-      } else {
-        // cancel the previous request, and count it as loaded
-        console.log('Canceling Request', modules[moduleName].version, version);
-        modules[moduleName].request.cancel();
-        modulesToLoad--;
-      }
-    } 
-    m = {
-      name: moduleName,
-      version: version,
-      loaded: false
-    }
-    moduleList.push(m);
-    modules[moduleName] = m;
-    modulesToLoad++;
-    m.request = retrieveJSON(generateModuleUrl(m.name, m.version) + '/package.json', function(error, package){
-      console.log(package);
-      loadModuleDependencies(package.dependencies, callback);
-    });
-  };
-  npmloader.loadModuleAndDependencies = loadModuleAndDependencies;
 
 	return npmloader;
 }));
